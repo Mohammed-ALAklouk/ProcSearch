@@ -1,0 +1,13 @@
+procSearch
+*.o
+
+*.pdf
+
+.DS_Store
+Thumbs.db
+
+*.swp
+*.swo
+.vscode/
+
+crawltest/
