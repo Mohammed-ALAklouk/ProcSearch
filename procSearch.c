@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <dirent.h>
+#include <ctype.h>
 
 typedef struct {
     char *target_dir;
@@ -181,6 +182,10 @@ int match_string_ignore_case(const char *a, const char *b) {
 }
 
 int is_match(char* file_name, struct stat statbuf, SearchArguments *criteria) {
+	if (S_ISDIR(statbuf.st_mode)) {
+		return 0; 
+	}
+
 	if (!match_string_ignore_case(criteria->pattern, file_name))  {
 		return 0;
 	}
@@ -190,6 +195,40 @@ int is_match(char* file_name, struct stat statbuf, SearchArguments *criteria) {
 	}
 
 	return 1;
+}
+
+int search_recursive (const char *dir_path, SearchArguments *criteria) {
+	DIR *dir = opendir(dir_path);
+	if (!dir) {
+		fprintf(stderr, "Error: Unable to open directory %s\n", dir_path);
+		return 0;
+	}
+
+	struct dirent* entry;
+	int match_count = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+			continue; // Skip current and parent directory entries
+		}
+
+		char new_path[4096];
+		snprintf(new_path, sizeof(new_path), "%s/%s", dir_path, entry->d_name);
+
+		struct stat statbuf;
+		if (lstat(new_path, &statbuf) == -1) continue;
+
+
+		if (S_ISDIR(statbuf.st_mode)) {
+			match_count += search_recursive (new_path, criteria);
+		}
+		else if (is_match(entry->d_name, statbuf, criteria)) {
+			printf("[Worker PID:%d] MATCH: %s (%ld bytes)\n", getpid(), new_path, statbuf.st_size);
+			match_count++;
+		}
+	}
+
+	closedir(dir);
+	return match_count;
 }
 
 
@@ -203,6 +242,17 @@ int main(int argc, char *argv[]) {
 	if (final_process_count < args.num_workers) {
 		args.num_workers = final_process_count;
 	}
+
+
+	for (int i = 0; i < args.num_workers; i++)
+	{
+		for (int j = 0; j < worker_dirs[i].num_dirs; j++)
+		{
+			int matches = search_recursive(worker_dirs[i].dirs[j], &args);
+			printf("[Worker PID:%d] Finished searching %s, found %d matches.\n", getpid(), worker_dirs[i].dirs[j], matches);
+		}
+	}
+	
 
 	free_worker_dirs(worker_dirs, array_length);
 
