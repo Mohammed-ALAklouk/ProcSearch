@@ -2,6 +2,8 @@
 #include <stdlib.h>   
 #include <unistd.h>   
 #include <sys/stat.h>
+#include <string.h>
+#include <dirent.h>
 
 typedef struct {
     char *target_dir;
@@ -9,6 +11,32 @@ typedef struct {
 	char *pattern;
 	long min_size;  // -1 for not set
 } SearchArguments;
+
+typedef struct {
+	char** dirs;
+	int num_dirs;
+} SubdirPartition ;
+
+void add_directory(SubdirPartition  *worker_dirs, const char *dir) {
+	char** new_dirs = realloc(worker_dirs->dirs, (worker_dirs->num_dirs + 1) * sizeof(char*));
+	if(!new_dirs) {
+		fprintf(stderr, "Error: Memory allocation failed while adding directory.\n");
+		exit(1);
+	}
+
+	worker_dirs->dirs = new_dirs;
+	worker_dirs->dirs[worker_dirs->num_dirs] = strdup(dir);
+	worker_dirs->num_dirs++;
+}
+
+void free_worker_dirs(SubdirPartition  *worker_dirs, int num_workers) {
+	for (int i = 0; i < num_workers; i++) {
+		for (int j = 0; j < worker_dirs[i].num_dirs; j++) {
+			free(worker_dirs[i].dirs[j]);
+		}
+		free(worker_dirs[i].dirs);
+	}
+}
 
 void print_usage_and_exit() {
 	fprintf(stderr, "Usage: ./procSearch -d <root_dir> -n <num_workers> -f <pattern> [-s <min_size_bytes>]\n");
@@ -86,6 +114,70 @@ void get_search_args (int argc, char *argv[], SearchArguments *args) {
 	}
 }
 
-int main() {
+
+int distribute_directories(const char *root_dir, SubdirPartition  *worker_dirs, int num_workers) {
+	DIR *dir = opendir(root_dir);
+	if (!dir) {
+		fprintf(stderr, "Error: Unable to open directory %s\n", root_dir);
+		print_usage_and_exit();
+	}
+
+	for (int i = 0; i < num_workers; i++) {
+		worker_dirs[i].dirs = NULL;
+		worker_dirs[i].num_dirs = 0;
+	}
+	int subdir_count = 0;
+
+	struct dirent* entry;
+	
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+			continue; 
+		}
+
+		char new_path[4096];
+		snprintf(new_path, sizeof(new_path), "%s/%s", root_dir, entry->d_name);
+
+		struct stat statbuf;
+		if (lstat(new_path, &statbuf) == -1) continue;
+		
+		
+		if (S_ISDIR(statbuf.st_mode)) {
+			add_directory(&worker_dirs[subdir_count % num_workers], new_path);
+			subdir_count++;
+		}
+	}
+
+	if (subdir_count == 0) {
+		printf("Notice: no subdirectories found; parent will search root directly.\n");
+	} else if (subdir_count < num_workers) {
+    	printf("Notice: only %d subdirectories found; using %d workers instead of %d.\n", subdir_count, subdir_count, num_workers);
+	}
+
+	closedir(dir);
+	return subdir_count;
+}
+
+int main(int argc, char *argv[]) {
+	SearchArguments args;
+	get_search_args(argc, argv, &args);
+
+	SubdirPartition  worker_dirs[args.num_workers];
+	int final_process_count = distribute_directories(args.target_dir, worker_dirs, args.num_workers);
+	if (final_process_count < args.num_workers) {
+		args.num_workers = final_process_count;
+	}
+
+
+	for (int i = 0; i < args.num_workers; i++) {
+		printf("Worker %d:\n", i);
+		for (int j = 0; j < worker_dirs[i].num_dirs; j++) {
+			printf("  %s\n", worker_dirs[i].dirs[j]);
+		}
+	}
+
+	free_worker_dirs(worker_dirs, args.num_workers);
+
+	return 0;
     
 }
