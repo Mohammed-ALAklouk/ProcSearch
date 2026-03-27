@@ -5,6 +5,59 @@
 #include <string.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <signal.h>
+#include <sys/wait.h>
+
+
+
+volatile sig_atomic_t workers_finished = 0;
+volatile sig_atomic_t sigint_received = 0;
+volatile sig_atomic_t sigterm_received = 0;
+volatile sig_atomic_t sigterm_sent = 0;
+
+volatile sig_atomic_t unexpected_exit_flag = 0;
+volatile sig_atomic_t last_failed_pid = 0;
+volatile sig_atomic_t last_failed_status = 0;
+
+volatile sig_atomic_t match_counts[8] = {0};
+pid_t worker_pids[8] = {0};
+
+void sigusr1_handler(int sig) {
+	(void)sig; // to silence unused parameter warning
+    workers_finished++;
+}
+
+void sigchld_handler(int sig) {
+	(void)sig; // to silence unused parameter warning
+	int status;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+		for (int i = 0; i < 8; i++) {
+			if (worker_pids[i] == pid) {
+				match_counts[i] = WIFEXITED(status) ? WEXITSTATUS(status) : 0;
+				break;
+			}
+		}
+		
+		if (!sigterm_sent && !WIFEXITED(status)) {  // if we didn't kill them ourselves and they didn't exit normally, flag it as unexpected
+			unexpected_exit_flag = 1;
+			last_failed_pid = pid;
+			last_failed_status = WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status);
+			workers_finished++;
+		}
+    }
+}
+
+void sigint_handler(int sig) {
+	(void)sig; // to silence unused parameter warning
+	sigint_received = 1;
+}
+
+void sigterm_handler(int sig) {
+	(void)sig; // to silence unused parameter warning
+	sigterm_received = 1;
+}
+
 
 typedef struct {
     char *target_dir;
@@ -197,6 +250,39 @@ int is_match(char* file_name, struct stat statbuf, SearchArguments *criteria) {
 	return 1;
 }
 
+int search_root_directory(SearchArguments *criteria) {
+	DIR *dir = opendir(criteria->target_dir);
+	if (!dir) {
+		fprintf(stderr, "Error: Unable to open directory %s\n", criteria->target_dir);
+		return 0;
+	}
+
+	struct dirent* entry;
+	int match_count = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+			continue; // Skip current and parent directory entries
+		}
+
+		if (sigterm_received)
+			break;
+		
+		char new_path[4096];
+		snprintf(new_path, sizeof(new_path), "%s/%s", criteria->target_dir, entry->d_name);
+
+		struct stat statbuf;
+		if (lstat(new_path, &statbuf) == -1) continue;
+
+		if (is_match(entry->d_name, statbuf, criteria)) {
+			printf("[Parent] MATCH: %s (%ld bytes)\n", new_path, statbuf.st_size);
+			match_count++;
+		}
+	}
+
+	closedir(dir);
+	return match_count;
+}
+
 int search_recursive (const char *dir_path, SearchArguments *criteria) {
 	DIR *dir = opendir(dir_path);
 	if (!dir) {
@@ -211,6 +297,9 @@ int search_recursive (const char *dir_path, SearchArguments *criteria) {
 			continue; // Skip current and parent directory entries
 		}
 
+		if (sigterm_received)
+			break;
+		
 		char new_path[4096];
 		snprintf(new_path, sizeof(new_path), "%s/%s", dir_path, entry->d_name);
 
@@ -232,7 +321,45 @@ int search_recursive (const char *dir_path, SearchArguments *criteria) {
 }
 
 
+
+void print_summary(SearchArguments *args, pid_t *pids, int parent_matches) {
+	int total_matches = 0;
+	for (int i = 0; i < 8; i++)
+		total_matches += match_counts[i];
+	
+	
+	printf("--- Summary ---\n");
+	printf("Total workers used  : %d\n", args->num_workers);
+	printf("Total matches found : %d\n", total_matches);
+	for (int i = 0; i < args->num_workers; i++) {
+		printf("Worker PID %d : %d matches\n", pids[i], match_counts[i]);
+	}
+	printf("Parent process matches : %d\n", parent_matches);
+}
+
+
 int main(int argc, char *argv[]) {
+	struct sigaction sa;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	
+	// SA_RESTART 
+	sa.sa_handler = sigusr1_handler;
+	sigaction(SIGUSR1, &sa, NULL);
+	
+	// SIGCHLD
+	sa.sa_handler = sigchld_handler;
+	sigaction(SIGCHLD, &sa, NULL);
+
+	// SIGINT
+	sa.sa_handler = sigint_handler;
+	sigaction(SIGINT, &sa, NULL);
+
+	// SIGTERM (worker side)
+	sa.sa_handler = sigterm_handler;
+	sigaction(SIGTERM, &sa, NULL);
+
+
 	SearchArguments args;
 	get_search_args(argc, argv, &args);
 
@@ -243,19 +370,53 @@ int main(int argc, char *argv[]) {
 		args.num_workers = final_process_count;
 	}
 
-
+	int parent_matches = search_root_directory(&args); 
+	
 	for (int i = 0; i < args.num_workers; i++)
 	{
-		for (int j = 0; j < worker_dirs[i].num_dirs; j++)
-		{
-			int matches = search_recursive(worker_dirs[i].dirs[j], &args);
-			printf("[Worker PID:%d] Finished searching %s, found %d matches.\n", getpid(), worker_dirs[i].dirs[j], matches);
+		worker_pids[i] = fork();
+		if (worker_pids[i] < 0) {
+			fprintf(stderr, "Error: Failed to fork worker process.\n");
+			exit(1);
+		} else if (worker_pids[i] == 0) {
+			int total_matches = 0;
+			for (int j = 0; j < worker_dirs[i].num_dirs; j++) {
+				total_matches += search_recursive(worker_dirs[i].dirs[j], &args);
+			}
+			kill(getppid(), SIGUSR1);
+			exit(total_matches % 256); 
 		}
 	}
 	
 
+	while (workers_finished < args.num_workers) {
+		if (sigint_received) {
+			printf("[Parent] SIGINT received. Terminating all workers...\n");
+			for (int i = 0; i < args.num_workers; i++) {
+				if (kill(worker_pids[i], 0) == 0)
+					kill(worker_pids[i], SIGTERM);
+			}
+			sigterm_sent = 1;
+
+			sleep(3);
+			printf("[Parent] Forcing termination of all workers...\n");
+			for (int i = 0; i < args.num_workers; i++) {
+				if (kill(worker_pids[i], 0) == 0)
+					kill(worker_pids[i], SIGKILL);
+			}
+
+			break;
+		}
+
+		if (unexpected_exit_flag) {
+			printf("[Parent] Worker PID: %d terminated unexpectedly (exit status: %d).\n", last_failed_pid, last_failed_status);
+			unexpected_exit_flag = 0; 
+		}
+		pause(); 
+	}
+
+	print_summary(&args, worker_pids, parent_matches);
 	free_worker_dirs(worker_dirs, array_length);
 
 	return 0;
-    
 }
