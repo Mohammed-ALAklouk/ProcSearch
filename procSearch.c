@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 
 
@@ -24,7 +25,7 @@ pid_t worker_pids[8] = {0};
 
 void sigusr1_handler(int sig) {
 	(void)sig; // to silence unused parameter warning
-    workers_finished++;
+    (void)workers_finished;
 }
 
 void sigchld_handler(int sig) {
@@ -43,8 +44,8 @@ void sigchld_handler(int sig) {
 			unexpected_exit_flag = 1;
 			last_failed_pid = pid;
 			last_failed_status = WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status);
-			workers_finished++;
 		}
+		workers_finished++;
     }
 }
 
@@ -56,6 +57,24 @@ void sigint_handler(int sig) {
 void sigterm_handler(int sig) {
 	(void)sig; // to silence unused parameter warning
 	sigterm_received = 1;
+}
+
+void init_signal_handlers() {
+	struct sigaction sa;
+	sa.sa_flags = SA_RESTART;
+	sigemptyset(&sa.sa_mask);
+	
+	sa.sa_handler = sigusr1_handler;
+	sigaction(SIGUSR1, &sa, NULL);
+	
+	sa.sa_handler = sigchld_handler;
+	sigaction(SIGCHLD, &sa, NULL);
+
+	sa.sa_handler = sigint_handler;
+	sigaction(SIGINT, &sa, NULL);
+
+	sa.sa_handler = sigterm_handler;
+	sigaction(SIGTERM, &sa, NULL);
 }
 
 
@@ -284,6 +303,10 @@ int search_root_directory(SearchArguments *criteria) {
 }
 
 int search_recursive (const char *dir_path, SearchArguments *criteria) {
+	if (sigterm_received){
+		return 0;
+	}
+	
 	DIR *dir = opendir(dir_path);
 	if (!dir) {
 		fprintf(stderr, "Error: Unable to open directory %s\n", dir_path);
@@ -292,21 +315,19 @@ int search_recursive (const char *dir_path, SearchArguments *criteria) {
 
 	struct dirent* entry;
 	int match_count = 0;
-	while ((entry = readdir(dir)) != NULL) {
+
+	while ((entry = readdir(dir)) != NULL) {		
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
 			continue; // Skip current and parent directory entries
 		}
-
-		if (sigterm_received)
-			break;
 		
 		char new_path[4096];
 		snprintf(new_path, sizeof(new_path), "%s/%s", dir_path, entry->d_name);
-
+		
 		struct stat statbuf;
 		if (lstat(new_path, &statbuf) == -1) continue;
-
-
+		
+		
 		if (S_ISDIR(statbuf.st_mode)) {
 			match_count += search_recursive (new_path, criteria);
 		}
@@ -315,12 +336,9 @@ int search_recursive (const char *dir_path, SearchArguments *criteria) {
 			match_count++;
 		}
 	}
-
 	closedir(dir);
 	return match_count;
 }
-
-
 
 void print_summary(SearchArguments *args, pid_t *pids, int parent_matches) {
 	int total_matches = 0;
@@ -337,41 +355,7 @@ void print_summary(SearchArguments *args, pid_t *pids, int parent_matches) {
 	printf("Parent process matches : %d\n", parent_matches);
 }
 
-
-int main(int argc, char *argv[]) {
-	struct sigaction sa;
-	sa.sa_flags = SA_RESTART;
-	sigemptyset(&sa.sa_mask);
-	
-	// SA_RESTART 
-	sa.sa_handler = sigusr1_handler;
-	sigaction(SIGUSR1, &sa, NULL);
-	
-	// SIGCHLD
-	sa.sa_handler = sigchld_handler;
-	sigaction(SIGCHLD, &sa, NULL);
-
-	// SIGINT
-	sa.sa_handler = sigint_handler;
-	sigaction(SIGINT, &sa, NULL);
-
-	// SIGTERM (worker side)
-	sa.sa_handler = sigterm_handler;
-	sigaction(SIGTERM, &sa, NULL);
-
-
-	SearchArguments args;
-	get_search_args(argc, argv, &args);
-
-	int array_length = args.num_workers;
-	SubdirPartition  worker_dirs[array_length];
-	int final_process_count = distribute_directories(args.target_dir, worker_dirs, args.num_workers);
-	if (final_process_count < args.num_workers) {
-		args.num_workers = final_process_count;
-	}
-
-	int parent_matches = search_root_directory(&args); 
-	
+void run_workers(SubdirPartition worker_dirs[], SearchArguments args) {
 	for (int i = 0; i < args.num_workers; i++)
 	{
 		worker_pids[i] = fork();
@@ -381,30 +365,52 @@ int main(int argc, char *argv[]) {
 		} else if (worker_pids[i] == 0) {
 			int total_matches = 0;
 			for (int j = 0; j < worker_dirs[i].num_dirs; j++) {
+				if (sigterm_received) {
+					printf("[Worker PID: %d] SIGTERM received. Partial matches: %d. Exiting.\n", getpid(), total_matches);
+					exit(total_matches % 256); 
+				}
+
 				total_matches += search_recursive(worker_dirs[i].dirs[j], &args);
 			}
+
+			printf("[Worker PID: %d] Finished with %d matches. Exiting.\n", getpid(), total_matches);
 			kill(getppid(), SIGUSR1);
 			exit(total_matches % 256); 
 		}
 	}
-	
+}
 
+void wait_for_workers(SearchArguments args) {
 	while (workers_finished < args.num_workers) {
 		if (sigint_received) {
-			printf("[Parent] SIGINT received. Terminating all workers...\n");
 			for (int i = 0; i < args.num_workers; i++) {
 				if (kill(worker_pids[i], 0) == 0)
 					kill(worker_pids[i], SIGTERM);
 			}
 			sigterm_sent = 1;
 
-			sleep(3);
-			printf("[Parent] Forcing termination of all workers...\n");
-			for (int i = 0; i < args.num_workers; i++) {
-				if (kill(worker_pids[i], 0) == 0)
-					kill(worker_pids[i], SIGKILL);
+
+			time_t start_time = time(NULL);
+			int all_terminated = 0;
+			while (time(NULL) - start_time < 3) {
+				if (workers_finished == args.num_workers) {
+					all_terminated = 1;
+					break; 
+				}
+				
+				usleep(100000); // Sleep for just 0.1 seconds, then check again
 			}
 
+			if (!all_terminated) {
+				printf("[Parent] Forcing termination of all workers...\n");
+				for (int i = 0; i < args.num_workers; i++) {
+					if (kill(worker_pids[i], 0) == 0)
+					{
+						kill(worker_pids[i], SIGKILL);
+						printf("[Parent] Worker PID: %d did not terminate gracefully, sent SIGKILL.\n", worker_pids[i]);
+					}
+				}
+			}
 			break;
 		}
 
@@ -414,9 +420,26 @@ int main(int argc, char *argv[]) {
 		}
 		pause(); 
 	}
+}
+
+int main(int argc, char *argv[]) {
+	init_signal_handlers();
+
+	SearchArguments args;
+	get_search_args(argc, argv, &args);
+
+	SubdirPartition  worker_dirs[args.num_workers];
+	int final_process_count = distribute_directories(args.target_dir, worker_dirs, args.num_workers);
+	if (final_process_count < args.num_workers) {
+		args.num_workers = final_process_count;
+	}
+
+	int parent_matches = search_root_directory(&args); 
+	
+	run_workers(worker_dirs, args);
+	wait_for_workers(args);
 
 	print_summary(&args, worker_pids, parent_matches);
-	free_worker_dirs(worker_dirs, array_length);
-
+	free_worker_dirs(worker_dirs, sizeof(worker_dirs) / sizeof(worker_dirs[0]));
 	return 0;
 }
