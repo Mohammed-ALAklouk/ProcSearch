@@ -114,7 +114,6 @@ void get_search_args (int argc, char *argv[], SearchArguments *args) {
 	}
 }
 
-
 int distribute_directories(const char *root_dir, SubdirPartition  *worker_dirs, int num_workers) {
 	DIR *dir = opendir(root_dir);
 	if (!dir) {
@@ -158,25 +157,54 @@ int distribute_directories(const char *root_dir, SubdirPartition  *worker_dirs, 
 	return subdir_count;
 }
 
+int match_string_ignore_case(const char *a, const char *b) {  
+	while (*a && *b) {
+		if (*a == '+') {
+			char preceding_char = *(a - 1);
+			while (tolower(*b) == tolower(preceding_char)) {
+				b++;
+			}
+
+			a++;
+			continue;
+		}
+
+		if (tolower(*a) != tolower(*b)) {
+			return 0;
+		}
+
+		a++;
+		b++;
+	}
+
+	return *a == '\0' && *b == '\0';
+}
+
+int is_match(char* file_name, struct stat statbuf, SearchArguments *criteria) {
+	if (!match_string_ignore_case(criteria->pattern, file_name))  {
+		return 0;
+	}
+
+	if (criteria->min_size != -1 && statbuf.st_size < criteria->min_size) {
+		return 0;
+	}
+
+	return 1;
+}
+
+
 int main(int argc, char *argv[]) {
 	SearchArguments args;
 	get_search_args(argc, argv, &args);
 
-	SubdirPartition  worker_dirs[args.num_workers];
+	int array_length = args.num_workers;
+	SubdirPartition  worker_dirs[array_length];
 	int final_process_count = distribute_directories(args.target_dir, worker_dirs, args.num_workers);
 	if (final_process_count < args.num_workers) {
 		args.num_workers = final_process_count;
 	}
 
-
-	for (int i = 0; i < args.num_workers; i++) {
-		printf("Worker %d:\n", i);
-		for (int j = 0; j < worker_dirs[i].num_dirs; j++) {
-			printf("  %s\n", worker_dirs[i].dirs[j]);
-		}
-	}
-
-	free_worker_dirs(worker_dirs, args.num_workers);
+	free_worker_dirs(worker_dirs, array_length);
 
 	return 0;
     
